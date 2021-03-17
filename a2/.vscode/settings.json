@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "__mutex_base": "c",
+        "atomic": "c",
+        "memory": "c",
+        "mutex": "c"
+    }
+}

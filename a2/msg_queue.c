@@ -55,7 +55,7 @@ typedef struct mq_backend
 
 	list_head hz_node;
 
-	cond_t hz_write_occupied; //Not Empty
+	cond_t hz_write_occupied;
 
 	cond_t hz_read_occupied;
 
@@ -262,8 +262,16 @@ int msg_queue_close(msg_queue_t *queue)
 	//TODO: if this is the last reader (or writer) handle, notify all the writer
 	//      (or reader) threads currently blocked in msg_queue_write() (or
 	//      msg_queue_read()) and msg_queue_poll() calls for this queue.
-
+	if (mq->no_readers)
+	{
+		cond_broadcast(&(mq->hz_read_occupied));
+	}
+	if (mq->no_writers)
+	{
+		cond_broadcast(&(mq->hz_write_occupied));
+	}
 	*queue = MSG_QUEUE_NULL;
+	mutex_unlock(&(mq->hz_mutex));
 	return 0;
 }
 
