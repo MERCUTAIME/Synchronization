@@ -28,9 +28,9 @@
 #include "msg_queue.h"
 #include "ring_buffer.h"
 
-
 // Message queue implementation backend
-typedef struct mq_backend {
+typedef struct mq_backend
+{
 	// Ring buffer for storing the messages
 	ring_buffer buffer;
 
@@ -51,13 +51,20 @@ typedef struct mq_backend {
 
 	//TODO: add necessary synchronization primitives, as well as data structures
 	//      needed to implement the msg_queue_poll() functionality
+	mutex_t hz_mutex;
+
+	list_head hz_node;
+
+	cond_t hz_write_occupied; //Not Empty
+
+	cond_t hz_read_occupied;
 
 } mq_backend;
 
-
 static int mq_init(mq_backend *mq, size_t capacity)
 {
-	if (ring_buffer_init(&mq->buffer, capacity) < 0) {
+	if (ring_buffer_init(&mq->buffer, capacity) < 0)
+	{
 		return -1;
 	}
 
@@ -69,7 +76,11 @@ static int mq_init(mq_backend *mq, size_t capacity)
 	mq->no_readers = false;
 	mq->no_writers = false;
 
-	//TODO: initialize remaining fields (synchronization primitives, etc.)
+	//Initialize remaining fields (synchronization primitives, etc.)
+	cond_init(&(mq->hz_read_occupied));
+	cond_init(&(mq->hz_write_occupied));
+	list_init(&(mq->hz_node));
+	mutex_init(&(mq->hz_mutex));
 
 	return 0;
 }
@@ -82,9 +93,12 @@ static void mq_destroy(mq_backend *mq)
 
 	ring_buffer_destroy(&mq->buffer);
 
-	//TODO: cleanup remaining fields (synchronization primitives, etc.)
+	//Cleanup remaining fields (synchronization primitives, etc.)
+	cond_destroy(&(mq->hz_write_occupied));
+	cond_destroy(&(mq->hz_read_occupied));
+	mutex_destroy(&(mq->hz_mutex));
+	list_destroy(&mq->hz_node);
 }
-
 
 #define ALL_FLAGS (MSG_QUEUE_READER | MSG_QUEUE_WRITER | MSG_QUEUE_NONBLOCK)
 
@@ -96,7 +110,7 @@ static void mq_destroy(mq_backend *mq)
 // Get queue backend pointer from the queue handle
 static mq_backend *get_backend(msg_queue_t queue)
 {
-	mq_backend *mq = (mq_backend*)(queue & ~ALL_FLAGS);
+	mq_backend *mq = (mq_backend *)(queue & ~ALL_FLAGS);
 	assert(mq);
 	return mq;
 }
@@ -115,16 +129,17 @@ static msg_queue_t make_handle(mq_backend *mq, int flags)
 	return (uintptr_t)mq | flags;
 }
 
-
 static msg_queue_t mq_open(mq_backend *mq, int flags)
 {
 	++mq->refs;
 
-	if (flags & MSG_QUEUE_READER) {
+	if (flags & MSG_QUEUE_READER)
+	{
 		++mq->readers;
 		mq->no_readers = false;
 	}
-	if (flags & MSG_QUEUE_WRITER) {
+	if (flags & MSG_QUEUE_WRITER)
+	{
 		++mq->writers;
 		mq->no_writers = false;
 	}
@@ -139,14 +154,17 @@ static bool mq_close(mq_backend *mq, int flags)
 	assert(mq->refs >= mq->readers);
 	assert(mq->refs >= mq->writers);
 
-	if ((flags & MSG_QUEUE_READER) && (--mq->readers == 0)) {
+	if ((flags & MSG_QUEUE_READER) && (--mq->readers == 0))
+	{
 		mq->no_readers = true;
 	}
-	if ((flags & MSG_QUEUE_WRITER) && (--mq->writers == 0)) {
+	if ((flags & MSG_QUEUE_WRITER) && (--mq->writers == 0))
+	{
 		mq->no_writers = true;
 	}
 
-	if (--mq->refs == 0) {
+	if (--mq->refs == 0)
+	{
 		assert(mq->readers == 0);
 		assert(mq->writers == 0);
 		return true;
@@ -154,10 +172,10 @@ static bool mq_close(mq_backend *mq, int flags)
 	return false;
 }
 
-
 msg_queue_t msg_queue_create(size_t capacity, int flags)
 {
-	if (flags & ~ALL_FLAGS) {
+	if (flags & ~ALL_FLAGS)
+	{
 		errno = EINVAL;
 		report_error("msg_queue_create");
 		return MSG_QUEUE_NULL;
@@ -165,14 +183,16 @@ msg_queue_t msg_queue_create(size_t capacity, int flags)
 
 	// Refuse to create a message queue without capacity for
 	// at least one message (length + 1 byte of message data).
-	if ( capacity < (sizeof(size_t) + 1) ) {
+	if (capacity < (sizeof(size_t) + 1))
+	{
 		errno = EINVAL;
 		report_error("msg_queue_create");
 		return MSG_QUEUE_NULL;
 	}
-	
-	mq_backend *mq = (mq_backend*)malloc(sizeof(mq_backend));
-	if (!mq) {
+
+	mq_backend *mq = (mq_backend *)malloc(sizeof(mq_backend));
+	if (!mq)
+	{
 		report_error("malloc");
 		return MSG_QUEUE_NULL;
 	}
@@ -180,7 +200,8 @@ msg_queue_t msg_queue_create(size_t capacity, int flags)
 	// 3 least significant bits of the handle to store the 3 bits of flags
 	assert(((uintptr_t)mq & ALL_FLAGS) == 0);
 
-	if (mq_init(mq, capacity) < 0) {
+	if (mq_init(mq, capacity) < 0)
+	{
 		// Preserve errno value that can be changed by free()
 		int e = errno;
 		free(mq);
@@ -193,13 +214,15 @@ msg_queue_t msg_queue_create(size_t capacity, int flags)
 
 msg_queue_t msg_queue_open(msg_queue_t queue, int flags)
 {
-	if (!queue) {
+	if (!queue)
+	{
 		errno = EBADF;
 		report_error("msg_queue_open");
 		return MSG_QUEUE_NULL;
 	}
 
-	if (flags & ~ALL_FLAGS) {
+	if (flags & ~ALL_FLAGS)
+	{
 		errno = EINVAL;
 		report_error("msg_queue_open");
 		return MSG_QUEUE_NULL;
@@ -207,16 +230,17 @@ msg_queue_t msg_queue_open(msg_queue_t queue, int flags)
 
 	mq_backend *mq = get_backend(queue);
 
-	//TODO: add necessary synchronization
-
+	//Add necessary synchronization
+	mutex_lock(&(mq->hz_mutex));
 	msg_queue_t new_handle = mq_open(mq, flags);
-
+	mutex_unlock(&(mq->hz_mutex));
 	return new_handle;
 }
 
 int msg_queue_close(msg_queue_t *queue)
 {
-	if (!queue || !*queue) {
+	if (!queue || !*queue)
+	{
 		errno = EBADF;
 		report_error("msg_queue_close");
 		return -1;
@@ -226,7 +250,8 @@ int msg_queue_close(msg_queue_t *queue)
 
 	//TODO: add necessary synchronization
 
-	if (mq_close(mq, get_flags(*queue))) {
+	if (mq_close(mq, get_flags(*queue)))
+	{
 		// Closed last handle; destroy the queue
 		mq_destroy(mq);
 		free(mq);
@@ -241,7 +266,6 @@ int msg_queue_close(msg_queue_t *queue)
 	*queue = MSG_QUEUE_NULL;
 	return 0;
 }
-
 
 ssize_t msg_queue_read(msg_queue_t queue, void *buffer, size_t length)
 {
@@ -262,7 +286,6 @@ int msg_queue_write(msg_queue_t queue, const void *buffer, size_t length)
 	errno = ENOSYS;
 	return -1;
 }
-
 
 int msg_queue_poll(msg_queue_pollfd *fds, size_t nfds)
 {
