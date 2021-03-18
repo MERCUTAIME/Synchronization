@@ -488,7 +488,7 @@ int msg_queue_write(msg_queue_t queue, const void *buffer, size_t length)
 		mq_backend *mq = get_backend(queue);
 		size_t buf_size = (mq->buffer).size;
 		size_t msg_size = length + sizeof(size_t);
-		size_t size = buf_size - length - get_size(&(mq->hz_mutex));
+		int size = buf_size - length - get_size(&(mq->hz_mutex));
 		//There are 3 error checking that need to perform
 		//1. Write is valid or not 2. Message size > buffer size or not
 		//3. Whether all write handler are closed
