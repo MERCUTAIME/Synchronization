@@ -34,7 +34,7 @@ typedef struct event_thread
 	mutex_t *poll_mutex; //poll_mutex pointer
 	cond_t *evt_wait;	 // condition variable for poll
 
-	bool stg_three_trigger; // Set to false when stage 3 is over
+	int *event_flag;
 
 	int evt;
 
@@ -72,6 +72,7 @@ typedef struct mq_backend
 	cond_t hz_write_occupied;
 
 	cond_t hz_read_occupied;
+	int *stg_three_trigger;
 
 } mq_backend;
 
@@ -105,13 +106,13 @@ static void mq_destroy(mq_backend *mq)
 	assert(mq->readers == 0);
 	assert(mq->writers == 0);
 
-	ring_buffer_destroy(&mq->buffer);
-
 	//Cleanup remaining fields (synchronization primitives, etc.)
+	mutex_destroy(&(mq->hz_mutex));
 	cond_destroy(&(mq->hz_write_occupied));
 	cond_destroy(&(mq->hz_read_occupied));
-	mutex_destroy(&(mq->hz_mutex));
+
 	list_destroy(&mq->hz_node);
+	ring_buffer_destroy(&mq->buffer);
 }
 
 #define ALL_FLAGS (MSG_QUEUE_READER | MSG_QUEUE_WRITER | MSG_QUEUE_NONBLOCK)
@@ -264,9 +265,11 @@ int msg_queue_close(msg_queue_t *queue)
 
 	//TODO: add necessary synchronization
 
+	mutex_lock(&(mq->hz_mutex));
 	if (mq_close(mq, get_flags(*queue)))
 	{
 		// Closed last handle; destroy the queue
+		mutex_unlock(&(mq->hz_mutex));
 		mq_destroy(mq);
 		free(mq);
 		*queue = MSG_QUEUE_NULL;
@@ -288,15 +291,16 @@ int msg_queue_close(msg_queue_t *queue)
 	mutex_unlock(&(mq->hz_mutex));
 	return 0;
 }
-void subscribe_event(event_thread *data, size_t (*ptr)(ring_buffer *), int evt, int evt_flg, void *buffer, bool is_read)
+void subscribe_event(event_thread *thread, size_t (*ptr)(ring_buffer *), int evt, int evt_flg, void *buffer, bool is_read, mq_backend *mq)
 {
-	if (((ptr(buffer) && !is_read) || (is_read && ptr(buffer) < sizeof(size_t))) && (evt & evt_flg))
+	if (((ptr(buffer) && !is_read) || (is_read && ptr(buffer) > sizeof(size_t))) && (evt & evt_flg))
 	{
-		data->stg_three_trigger = true;
-		cond_signal(data->evt_wait);
+		*(thread->event_flag) = 1;
+		*(mq->stg_three_trigger) = 1;
+		cond_signal(thread->evt_wait);
 	}
 }
-int has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
+void has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 {
 	int handled_symbol = MQPOLL_WRITABLE;
 	if (!is_read)
@@ -311,16 +315,14 @@ int has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 			event_thread *data = container_of(root, event_thread, ent);
 
 			mutex_lock(data->poll_mutex);
-			if (data->queue != MSG_QUEUE_NULL && data && handled_symbol)
+			if (data->queue != MSG_QUEUE_NULL && data)
 			{
-				subscribe_event(data, ring_buffer_free, data->evt, is_read, &(mq->buffer), is_read);
+				subscribe_event(data, ring_buffer_free, data->evt, handled_symbol, &(mq->buffer), is_read, mq);
 			}
 		}
 	}
 
 	mutex_unlock(&(mq->hz_mutex));
-
-	return -1;
 }
 
 /*Helper function for error checking when performing read and write action
