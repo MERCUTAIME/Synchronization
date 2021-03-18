@@ -311,7 +311,7 @@ int has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 			event_thread *data = container_of(root, event_thread, ent);
 
 			mutex_lock(data->poll_mutex);
-			if (data->queue != MSG_QUEUE_NULL && data)
+			if (data->queue != MSG_QUEUE_NULL && data && handled_symbol)
 			{
 				subscribe_event(data, ring_buffer_free, data->evt, is_read, &(mq->buffer), is_read);
 			}
