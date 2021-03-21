@@ -28,15 +28,6 @@
 #include "msg_queue.h"
 #include "ring_buffer.h"
 
-/** A read operation. */
-#define READ 1
-
-/** A read operation. */
-#define WRITE 2
-
-/** A close operation. */
-#define CLOSE 3
-
 // Message queue implementation backend
 typedef struct mq_backend
 {
@@ -64,23 +55,11 @@ typedef struct mq_backend
 	// read write poll mutex
 	mutex_t hz_mutex;
 
-	// head of linked list
-	list_head hz_node;
-
-	// conditional variable to check if write is occupied
-	cond_t hz_write_occupied;
-
-	// conditional variable to check if read is occupied
-	cond_t hz_read_occupied;
-	
-	// list entry to traverse the linked list
-	list_entry ent;
-	
 	// pointer of mutex for poll
 	mutex_t *poll_mutex; 
 	
-	// pointer of condition variable for poll
-	cond_t *evt_wait;
+	// head of linked list 
+	list_head hz_node;
 
 	// pointer of predicate for poll
 	int *stg_three_trigger;
@@ -90,6 +69,20 @@ typedef struct mq_backend
 
 	// queue handle
 	msg_queue_t queue;
+
+	// conditional variable to check if buffer is occupied,when performing write
+	cond_t hz_write_occupied;
+
+	// conditional variable to check if buffer is occupied,when performing read
+	cond_t hz_read_occupied;
+	
+	// list entry to traverse the linked list that used to track the subscribed events
+	list_entry ent;
+	
+
+	// pointer of condition variable for poll
+	cond_t *evt_wait;
+
 
 } mq_backend;
 
@@ -124,14 +117,14 @@ static void mq_destroy(mq_backend *mq)
 	assert(mq->refs == 0);
 	assert(mq->readers == 0);
 	assert(mq->writers == 0);
-
+	
+	ring_buffer_destroy(&mq->buffer);
 	//Cleanup remaining fields (synchronization primitives, etc.)
 	mutex_destroy(&(mq->hz_mutex));
 	cond_destroy(&(mq->hz_write_occupied));
 	cond_destroy(&(mq->hz_read_occupied));
+	list_destroy(&mq->hz_node);
 
-	// list_destroy(&mq->hz_node);
-	ring_buffer_destroy(&mq->buffer);
 }
 
 #define ALL_FLAGS (MSG_QUEUE_READER | MSG_QUEUE_WRITER | MSG_QUEUE_NONBLOCK)
@@ -281,28 +274,30 @@ void subscribe_event(mq_backend *thread, size_t (*ptr)(ring_buffer *), int evt, 
 	}
 }
 
-
+// When performing msg_queue_close, if the linked list is not empty, 
+// We need to update the subscribed the event through all entries in the linked
 void update_ent(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 {
 	if (next != head)
 	{
-		list_entry *root = NULL;
+		list_entry *root;
 		list_for_each(root, &(mq->hz_node))
 		{
-			mq_backend *thread = container_of(root, mq_backend, ent);
+			mq_backend *new_mq = container_of(root, mq_backend, ent);
 
-			mutex_lock(thread->poll_mutex);
-			if (thread->queue != MSG_QUEUE_NULL && thread)
+			mutex_lock(new_mq->poll_mutex);
+			// Make sure that Msg queue is not null
+			if (new_mq->queue != MSG_QUEUE_NULL && new_mq)
 			{
 				size_t (*ptr)(ring_buffer *) = ring_buffer_free;
 				int flags[4] = {MQPOLL_WRITABLE, MQPOLL_NOREADERS, MQPOLL_READABLE, MQPOLL_NOWRITERS};
 				for (int i = 0; i < 4; i++)
 				{
 					is_read = i < 2;
-					subscribe_event(thread, ptr, thread->evt, flags[i], &(mq->buffer), is_read, mq, true);
+					subscribe_event(new_mq, ptr, new_mq->evt, flags[i], &(mq->buffer), is_read, mq, true);
 				}
 			}
-			mutex_unlock(thread->poll_mutex);
+			mutex_unlock(new_mq->poll_mutex);
 		}
 	}
 }
@@ -350,6 +345,8 @@ int msg_queue_close(msg_queue_t *queue)
 	return 0;
 }
 
+// When performing read or write, if the linked list is not empty, 
+// We need to update the subscribed the event through all entries in the linked
 void has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 {
 	int handled_symbol = MQPOLL_WRITABLE;
@@ -357,19 +354,19 @@ void has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 	{
 		handled_symbol = MQPOLL_READABLE;
 	}
-	if (next == head)
+	if (next != head)
 	{
 		list_entry *root;
 		list_for_each(root, &(mq->hz_node))
 		{
-			mq_backend *data = container_of(root, mq_backend, ent);
-
-			mutex_lock(data->poll_mutex);
-			if (data->queue != MSG_QUEUE_NULL && data)
+			mq_backend *new_mq = container_of(root, mq_backend, ent);
+			// Make sure that Msg queue is not null
+			mutex_lock(new_mq->poll_mutex);
+			if (new_mq->queue != MSG_QUEUE_NULL && new_mq)
 			{
-				subscribe_event(data, ring_buffer_free, data->evt, handled_symbol, &(mq->buffer), is_read, mq, false);
+				subscribe_event(new_mq, ring_buffer_free, new_mq->evt, handled_symbol, &(mq->buffer), is_read, mq, false);
 			}
-			mutex_unlock(data->poll_mutex);
+			mutex_unlock(new_mq->poll_mutex);
 		}
 	}
 	mutex_unlock(&(mq->hz_mutex));
@@ -522,6 +519,7 @@ ssize_t msg_queue_read(msg_queue_t queue, void *buffer, size_t length)
 		{
 			return -1;
 		}
+		//Subscribe Event in all entry
 		has_entry(true, &(mq->hz_node.head), mq->hz_node.head.next, mq);
 
 		return size_msg;
@@ -557,11 +555,12 @@ int msg_queue_write(msg_queue_t queue, const void *buffer, size_t length)
 		{
 			return -1;
 		}
+		// Perform write message and update msg length
 		if (rw_msg(mq, false, sizeof(size_t), length, (void *)buffer, &(mq->hz_write_occupied)) == -1)
 		{
 			return -1;
 		}
-
+		//Subscribe Event in all entry
 		has_entry(false, &(mq->hz_node.head), mq->hz_node.head.next, mq);
 		err = 0;
 	}
@@ -802,8 +801,8 @@ int msg_queue_poll(msg_queue_pollfd *fds, size_t nfds)
 	//Handling Stage 1
 	int triggered_events = 0;
 	triggered_events = stage_one_handler(&evt_wait, &stg_three_trigger, data, nfds, fds, &wait_mutex);
-
-	if (triggered_events == -1)
+	//Check if STAGE 1 generate any error
+	if (triggered_events <0)
 	{
 		return -1;
 	}
