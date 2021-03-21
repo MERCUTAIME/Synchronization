@@ -22,11 +22,21 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "errors.h"
 #include "list.h"
 #include "msg_queue.h"
 #include "ring_buffer.h"
+
+/** A read operation. */
+#define READ 1
+
+/** A read operation. */
+#define WRITE 2
+
+/** A close operation. */
+#define CLOSE 3
 
 // Message queue implementation backend
 typedef struct mq_backend
@@ -58,13 +68,9 @@ typedef struct mq_backend
 	cond_t hz_write_occupied;
 
 	cond_t hz_read_occupied;
-	int *stg_three_trigger;
-
-} mq_backend;
-typedef struct event_thread
-{
+	
 	list_entry ent;
-	mutex_t *poll_mutex; //poll_mutex pointer
+	mutex_t *poll_mutex; // pointer of mutex for poll
 	cond_t *evt_wait;	 // condition variable for poll
 
 	int *stg_three_trigger;
@@ -73,7 +79,8 @@ typedef struct event_thread
 
 	msg_queue_t queue;
 
-} event_thread;
+} mq_backend;
+
 static int mq_init(mq_backend *mq, size_t capacity)
 {
 	if (ring_buffer_init(&mq->buffer, capacity) < 0)
@@ -109,7 +116,7 @@ static void mq_destroy(mq_backend *mq)
 	cond_destroy(&(mq->hz_write_occupied));
 	cond_destroy(&(mq->hz_read_occupied));
 
-	list_destroy(&mq->hz_node);
+	// list_destroy(&mq->hz_node);
 	ring_buffer_destroy(&mq->buffer);
 }
 
@@ -249,12 +256,12 @@ msg_queue_t msg_queue_open(msg_queue_t queue, int flags)
 	mutex_unlock(&(mq->hz_mutex));
 	return new_handle;
 }
-void subscribe_event(event_thread *thread, size_t (*ptr)(ring_buffer *), int evt, int evt_flg, void *buffer, bool is_read, mq_backend *mq, bool is_update)
+
+void subscribe_event(mq_backend *thread, size_t (*ptr)(ring_buffer *), int evt, int evt_flg, void *buffer, bool is_read, mq_backend *mq, bool is_update)
 {
 	if (((is_update && is_read && mq->no_readers) || (is_update && !is_read && mq->no_writers) || (!is_update && ptr(buffer) && !is_read) || (!is_update && is_read && ptr(buffer) > sizeof(size_t))) && (evt & evt_flg))
 	{
 		*(thread->stg_three_trigger) = 1;
-		*(mq->stg_three_trigger) = 1;
 		cond_signal(thread->evt_wait);
 	}
 }
@@ -265,7 +272,7 @@ void update_ent(bool is_read, list_entry *head, list_entry *next, mq_backend *mq
 		list_entry *root = NULL;
 		list_for_each(root, &(mq->hz_node))
 		{
-			event_thread *thread = container_of(root, event_thread, ent);
+			mq_backend *thread = container_of(root, mq_backend, ent);
 
 			mutex_lock(thread->poll_mutex);
 			if (thread->queue != MSG_QUEUE_NULL && thread)
@@ -337,7 +344,7 @@ void has_entry(bool is_read, list_entry *head, list_entry *next, mq_backend *mq)
 		list_entry *root;
 		list_for_each(root, &(mq->hz_node))
 		{
-			event_thread *data = container_of(root, event_thread, ent);
+			mq_backend *data = container_of(root, mq_backend, ent);
 
 			mutex_lock(data->poll_mutex);
 			if (data->queue != MSG_QUEUE_NULL && data)
@@ -545,11 +552,265 @@ int msg_queue_write(msg_queue_t queue, const void *buffer, size_t length)
 	return err;
 }
 
+/*
+Report Error if for a non-reader/non-writer handle, 
+non-corresponding event flag is triggerd
+*/
+bool check_EINVAL(mq_backend *mq, size_t i, msg_queue_pollfd *fds, int mq_flag, mutex_t *wait_mutex)
+{
+	if ((fds[i].events & !(MQPOLL_READABLE || MQPOLL_WRITABLE || MQPOLL_NOREADERS || MQPOLL_NOWRITERS)) || ((fds[i].events & MQPOLL_READABLE) && !((mq_flag & MSG_QUEUE_READER))) || ((fds[i].events & MQPOLL_WRITABLE) && !(mq_flag & MSG_QUEUE_WRITER)))
+	{
+		errno = EINVAL;
+		report_error("msg_queue_poll");
+		mutex_unlock(wait_mutex);
+		mutex_unlock(&(mq->hz_mutex));
+		return true;
+	}
+	return false;
+}
+
+/*
+Init the event thread attribute
+*/
+mq_backend init_evt_thread(mq_backend thread, cond_t *evt_wait, int events, msg_queue_t q, mutex_t *wait_mutex, int *stg_three_trigger)
+{
+	thread.queue = q;
+	thread.evt = events;
+	thread.poll_mutex = wait_mutex;
+	thread.evt_wait = evt_wait;
+	thread.stg_three_trigger = stg_three_trigger;
+	return thread;
+}
+
+/*
+Handle subscription event for reader and writer given handle symbol
+Handle symbol is either MSG_QUEUE_READER , MSG_QUEUE_WRITER 
+indicating the handle is reader or writer
+reader subscribe -> MQPOLL_NOWRITERS;
+writer subscribe->MQPOLL_NOREADERS;
+*/
+mq_backend rw_subscribe(int flag, int handle_symbol, int subscription, mq_backend thread)
+{
+	if (handle_symbol & flag)
+		thread.evt |= subscription;
+	return thread;
+}
+/*
+Update revent if corresponding hanldes(read/write) is closed,
+or event flag match message status(wait to be read/write) 
+
+*/
+bool update_revent_rw_enable(size_t (*ptr)(ring_buffer *), int handle_symbol, int index, mq_backend *data, msg_queue_pollfd *mg_fd, ring_buffer *buffer, int closed_rw, bool is_read)
+{
+	if ((data[index].evt & handle_symbol) && ((ptr(buffer) && is_read) || (!is_read && ptr(buffer) > sizeof(size_t)) || closed_rw))
+	{
+		mg_fd[index].revents |= handle_symbol;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+Set revent to corresponding handle symbol 
+if all read or write handles are closed 
+*/
+bool update_revent_rw_closed(int handle_symbol, int index, mq_backend *data, msg_queue_pollfd *mg_fd, int closed_rw)
+{
+	if (closed_rw && (data[index].evt & handle_symbol))
+	{
+		mg_fd[index].revents |= handle_symbol;
+		return true;
+	}
+
+	return false;
+}
+/*
+Helper funciton for Stage 1 and 3 to check if any of the requested events on any of the 
+message queues have already been triggered. 
+*/
+int check_triggered_events(void (*lst_op)(list_head *, list_entry *), cond_t *evt_wait, int *stg_three_trigger, mq_backend *data, size_t nfds, msg_queue_pollfd *mg_fd, mutex_t *wait_mutex)
+{
+	unsigned int k = 0;
+	// Number of time for updating revent
+	unsigned int num_updated_revent = 0;
+	int triggered_events = 0;
+	while (k < nfds)
+	{
+		// Ensure that queue is not NULL
+		if (mg_fd[k].queue != MSG_QUEUE_NULL)
+		{
+			mq_backend *mq = get_backend(mg_fd[k].queue);
+			//Put all mutex on wait
+			mutex_lock(&(mq->hz_mutex));
+			mutex_lock(wait_mutex);
+			int evt_flag[2] = {MQPOLL_NOWRITERS, MQPOLL_NOREADERS};
+
+			data[k] = init_evt_thread(data[k], evt_wait, mg_fd[k].events, mg_fd[k].queue, wait_mutex, stg_three_trigger);
+			int flg = get_flags((mg_fd + k)->queue);
+			int queue_flag[2] = {MSG_QUEUE_READER, MSG_QUEUE_WRITER};
+			// Handle subscription event for reader and writer given handle symbol
+			for (int c = 0; c < 2; c++)
+			{
+				data[k] = rw_subscribe(flg, queue_flag[c], evt_flag[c], data[k]);
+			}
+			
+			//check EINVAL.
+			if (check_EINVAL(mq, k, mg_fd, flg, wait_mutex))
+				return -1;
+
+			// Set revent based on the event flag, MQPOLL_READABLE,MQPOLL_WRITABLE,MQPOLL_NOREADERS and MQPOLL_NOWRITERS
+			// Record the number of time that revent update
+			num_updated_revent += (int)update_revent_rw_enable(ring_buffer_used, MQPOLL_READABLE, k, data, mg_fd, &(mq->buffer), mq->no_writers, true);
+			num_updated_revent += (int)update_revent_rw_enable(ring_buffer_free, MQPOLL_WRITABLE, k, data, mg_fd, &(mq->buffer), mq->no_readers, false);
+			mg_fd[k].revents = num_updated_revent > 0 ? mg_fd[k].revents : 0;
+			num_updated_revent += (int)update_revent_rw_closed(evt_flag[1], k, data, mg_fd, mq->no_readers);
+			num_updated_revent += (int)update_revent_rw_closed(evt_flag[0], k, data, mg_fd, mq->no_writers);
+			triggered_events += num_updated_revent > 0 ? 1 : 0;
+			lst_op(&(mq->hz_node), &(data[k].ent));
+			//unlock mutex
+			mutex_unlock(wait_mutex);
+			mutex_unlock(&(mq->hz_mutex));
+		}
+		else
+			mg_fd[k].revents = 0;
+		++k;
+	}
+
+	return triggered_events;
+}
+
+/*
+
+STAGE 1 Handler:
+Check if any of the requested events on any of the 
+message queues have already been triggered. 
+*/
+int stage_one_handler(cond_t *evt_wait, int *stg_three_trigger, mq_backend *data, size_t nfds, msg_queue_pollfd *mg_fd, mutex_t *wait_mutex)
+{
+	int triggered_events = check_triggered_events(list_add_tail, evt_wait, stg_three_trigger, data, nfds, mg_fd, wait_mutex);
+	if (triggered_events)
+	{
+		unsigned int k = 0;
+		while (k < nfds)
+		{
+			if (mg_fd[k].queue == MSG_QUEUE_NULL)
+			{
+
+				mg_fd[k].revents = 0; //Set revent to 0
+			}
+			else
+			{ // Only enter critical section when MSG Queue is not null
+				mq_backend *mq = get_backend(mg_fd[k].queue);
+				mutex_lock(&(mq->hz_mutex));
+				mutex_lock(wait_mutex);
+				list_del(&(mq->hz_node), &(data[k].ent));
+				mutex_unlock(wait_mutex);
+				mutex_unlock(&(mq->hz_mutex));
+			}
+			++k;
+		}
+
+		cond_destroy(evt_wait);
+		mutex_destroy(wait_mutex);
+	}
+
+	return triggered_events;
+}
+
+//Entering Stage II
+void stg_two_blocking(mutex_t *wait_mutex, cond_t *evt_wait, int *stg_three_trigger)
+{
+	mutex_lock(wait_mutex);
+	//If none of the requested events are already triggered
+	while (!(*stg_three_trigger))
+	{
+		//Block until another thread triggers an event
+		cond_wait(evt_wait, wait_mutex);
+	}
+	mutex_unlock(wait_mutex);
+}
+
+/*Handling Stage III
+Determine what events have been triggered, and 
+return the number of message queues with any triggered events. 
+*/
+int stg_three_check_queue(void (*lst_op)(list_head *, list_entry *), mutex_t *wait_mutex, mq_backend *data, size_t nfds, msg_queue_pollfd *mg_fd)
+{
+	unsigned int k = 0;
+	// Number of time for updating revent
+	unsigned int num_updated_revent = 0;
+	int msg_q_triggered = 0;
+	while (k < nfds)
+	{
+		// Ensure that queue is not NULL
+		if (mg_fd[k].queue != MSG_QUEUE_NULL)
+		{
+			mq_backend *mq = get_backend(mg_fd[k].queue);
+			//Put all mutex on wait
+			mutex_lock(&(mq->hz_mutex));
+			mutex_lock(wait_mutex);
+			int evt_flag[2] = {MQPOLL_NOWRITERS, MQPOLL_NOREADERS};
+			// Set revent based on the event flag, MQPOLL_READABLE,MQPOLL_WRITABLE,MQPOLL_NOREADERS and MQPOLL_NOWRITERS
+			// Record the number of time that revent update
+			num_updated_revent += (int)update_revent_rw_enable(ring_buffer_used, MQPOLL_READABLE, k, data, mg_fd, &(mq->buffer), mq->no_writers, true);
+			num_updated_revent += (int)update_revent_rw_enable(ring_buffer_free, MQPOLL_WRITABLE, k, data, mg_fd, &(mq->buffer), mq->no_readers, false);
+			mg_fd[k].revents = num_updated_revent > 0 ? mg_fd[k].revents : 0;
+			num_updated_revent += (int)update_revent_rw_closed(evt_flag[1], k, data, mg_fd, mq->no_readers);
+			num_updated_revent += (int)update_revent_rw_closed(evt_flag[0], k, data, mg_fd, mq->no_writers);
+			msg_q_triggered += num_updated_revent > 0 ? 1 : 0;
+			lst_op(&(mq->hz_node), &(data[k].ent));
+			//unlock mutex
+			mutex_unlock(wait_mutex);
+			mutex_unlock(&(mq->hz_mutex));
+		}
+		else
+			mg_fd[k].revents = 0;
+		++k;
+	}
+
+	return msg_q_triggered;
+}
+
 int msg_queue_poll(msg_queue_pollfd *fds, size_t nfds)
 {
-	//TODO
-	(void)fds;
-	(void)nfds;
-	errno = ENOSYS;
-	return -1;
+
+	//Define mutex & condition variable & mq_backend
+	cond_t evt_wait;
+	mutex_t wait_mutex;
+	mq_backend data[nfds];
+	int stg_three_trigger = 0;
+
+	//if size is 0, report error
+	if (nfds == 0)
+	{
+		errno = EINVAL;
+		report_error("msg_queue_poll");
+		return -1;
+	}
+	//If no error then init
+	mutex_init(&wait_mutex);
+	cond_init(&evt_wait);
+
+	//Handling Stage 1
+	int triggered_events = 0;
+	triggered_events = stage_one_handler(&evt_wait, &stg_three_trigger, data, nfds, fds, &wait_mutex);
+
+	if (triggered_events == -1)
+	{
+		return -1;
+	}
+	else if (triggered_events == 0)
+	{
+
+		//Handling Stage 2
+		stg_two_blocking(&wait_mutex, &evt_wait, &stg_three_trigger);
+		//Handling Stage 3
+		triggered_events = stg_three_check_queue(list_del, &wait_mutex, data, nfds, fds);
+
+		//Clear all mutex and conditional var
+		cond_destroy(&evt_wait);
+		mutex_destroy(&wait_mutex);
+	}
+	return triggered_events;
 }
